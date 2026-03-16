@@ -75,14 +75,17 @@ class GranolaParser:
                 raise GranolaParseError("Cache file missing required 'cache' field")
 
             cache_content = outer_data['cache']
-            if not isinstance(cache_content, str):
-                raise GranolaParseError("Cache field must contain a JSON string")
-
-            # Second JSON parse - parse the inner cache content
-            try:
-                self._cache_data = json.loads(cache_content)
-            except json.JSONDecodeError as e:
-                raise GranolaParseError(f"Invalid JSON in cache content: {e}") from e
+            if isinstance(cache_content, dict):
+                # v4 format: cache is already a parsed dict
+                self._cache_data = cache_content
+            elif isinstance(cache_content, str):
+                # v3 format: cache is a JSON string that needs second parse
+                try:
+                    self._cache_data = json.loads(cache_content)
+                except json.JSONDecodeError as e:
+                    raise GranolaParseError(f"Invalid JSON in cache content: {e}") from e
+            else:
+                raise GranolaParseError("Cache field must contain a JSON string or object")
 
             if not isinstance(self._cache_data, dict):
                 raise GranolaParseError("Cache content must be a JSON object")

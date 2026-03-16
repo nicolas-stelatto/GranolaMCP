@@ -109,9 +109,15 @@ def get_cache_path(config: Optional[Dict[str, str]] = None) -> str:
         # Expand user home directory if needed
         return os.path.expanduser(cache_path)
 
-    # Default cache path
-    default_path = "/Users/pedram/Library/Application Support/Granola/cache-v3.json"
-    return os.path.expanduser(default_path)
+    # Default cache path - try versions from newest to oldest
+    home = os.path.expanduser("~")
+    for version in ("cache-v6.json", "cache-v5.json", "cache-v4.json", "cache-v3.json"):
+        candidate = os.path.join(home, "Library", "Application Support", "Granola", version)
+        if os.path.exists(candidate):
+            return candidate
+
+    # Fallback to latest known version path
+    return os.path.join(home, "Library", "Application Support", "Granola", "cache-v6.json")
 
 
 def get_config_value(key: str, default: Optional[str] = None, config: Optional[Dict[str, str]] = None) -> Optional[str]:
