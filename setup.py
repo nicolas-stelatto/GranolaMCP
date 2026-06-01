@@ -48,7 +48,11 @@ setup(
     ],
     python_requires=">=3.12",
     install_requires=[
-        # No external dependencies - using only Python standard library
+        # Granola encriptou o cache local em mar/2026; agora vamos pela API.
+        # Cryptography: decriptar storage.dek + supabase.json.enc
+        # Keyring: ler chave AES do macOS Keychain (Granola Safe Storage)
+        "cryptography>=42.0.0",
+        "keyring>=24.0.0",
     ],
     extras_require={
         "dev": [

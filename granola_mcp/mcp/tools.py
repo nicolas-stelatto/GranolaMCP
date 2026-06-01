@@ -307,17 +307,10 @@ class MCPTools:
             Dict containing complete meeting details
         """
         try:
-            meetings = self._get_meetings()
-
-            # Find the meeting
-            meeting = None
-            for m in meetings:
-                if m.id == meeting_id:
-                    meeting = m
-                    break
-
-            if not meeting:
+            enriched = self.parser.get_enriched_meeting(meeting_id)
+            if enriched is None:
                 raise MCPToolError(f"Meeting not found: {meeting_id}")
+            meeting = Meeting(enriched)
 
             # Build complete meeting data
             result = {
@@ -364,17 +357,10 @@ class MCPTools:
             Dict containing transcript data
         """
         try:
-            meetings = self._get_meetings()
-
-            # Find the meeting
-            meeting = None
-            for m in meetings:
-                if m.id == meeting_id:
-                    meeting = m
-                    break
-
-            if not meeting:
+            enriched = self.parser.get_enriched_meeting(meeting_id)
+            if enriched is None:
                 raise MCPToolError(f"Meeting not found: {meeting_id}")
+            meeting = Meeting(enriched)
 
             if not meeting.has_transcript():
                 raise MCPToolError(f"Meeting has no transcript: {meeting_id}")
@@ -431,17 +417,10 @@ class MCPTools:
             Dict containing meeting notes and summary
         """
         try:
-            meetings = self._get_meetings()
-
-            # Find the meeting
-            meeting = None
-            for m in meetings:
-                if m.id == meeting_id:
-                    meeting = m
-                    break
-
-            if not meeting:
+            enriched = self.parser.get_enriched_meeting(meeting_id)
+            if enriched is None:
                 raise MCPToolError(f"Meeting not found: {meeting_id}")
+            meeting = Meeting(enriched)
 
             result = {
                 "meeting_id": meeting_id,
@@ -450,6 +429,7 @@ class MCPTools:
                 "duration": f"{int(meeting.duration.total_seconds() / 60)} minutes" if meeting.duration else None,
                 "participants": meeting.participants,
                 "summary": meeting.summary,
+                "human_notes": meeting.human_notes,
                 "tags": meeting.tags
             }
 

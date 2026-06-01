@@ -1,298 +1,191 @@
 """
-JSON parser for GranolaMCP.
+Adaptador da API do Granola para o formato esperado pelo restante do MCP.
 
-Provides the GranolaParser class for loading and parsing Granola.ai cache files
-with double JSON parsing and proper error handling.
+Mantem a interface da `GranolaParser` legada (que lia o cache JSON local),
+mas internamente chama a API REST `https://api.granola.ai` via api_client.
+
+Trade-offs:
+- `get_meetings()` carrega a LISTA de documentos (campos basicos). Transcript
+  e Summary nao sao trazidos aqui — sao caros (1 req por meeting).
+- `get_enriched_meeting(id)` faz 3 chamadas (doc + transcript + panels) e
+  retorna um dict completo no formato Meeting-compatible.
+
+Decisao deliberada: nao manter cache local. Cada `_get_meetings()` do tools.py
+faz uma listagem fresca da API — typically <1s para ~100 docs.
 """
 
-import json
-import os
-from typing import Dict, Any, List, Optional
-from ..utils.config import get_cache_path, validate_cache_path
+from typing import Any, Dict, List, Optional
+
+from .api_client import GranolaApiClient, GranolaApiError
 
 
 class GranolaParseError(Exception):
-    """Custom exception for Granola parsing errors."""
-    pass
+    """Compatibilidade com o codigo legado que importa esse simbolo."""
 
 
 class GranolaParser:
-    """
-    Parser for Granola.ai cache files.
-
-    Handles the double JSON parsing required for Granola cache files:
-    1. Parse the outer JSON structure
-    2. Parse the inner 'cache' field which contains JSON as a string
-    """
+    """Fachada sobre `GranolaApiClient` no formato esperado pelo `Meeting`."""
 
     def __init__(self, cache_path: Optional[str] = None):
-        """
-        Initialize the GranolaParser.
+        # cache_path eh ignorado — mantido na assinatura para retro-compat.
+        self._client = GranolaApiClient()
+        self._docs_cache: Optional[List[Dict[str, Any]]] = None
 
-        Args:
-            cache_path: Path to the cache file (if None, uses config default)
-        """
-        self.cache_path = cache_path or get_cache_path()
-        self._cache_data: Optional[Dict[str, Any]] = None
-        self._raw_data: Optional[str] = None
+    # ------------------------------------------------------------------
+    # Transformacao API -> formato Meeting-compatible
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _doc_to_meeting_dict(doc: Dict[str, Any]) -> Dict[str, Any]:
+        """Transforma um doc da API no shape esperado pela classe Meeting.
 
+        Mudancas principais:
+        - `google_calendar_event.start/end` -> top-level `start`/`end`
+          (Meeting.start_time chega via `data['start']['dateTime']`)
+        - `google_calendar_event.attendees` -> top-level `attendees`
+        - `has_transcript`: True se nao foi deletado e teve fim de meeting
+        """
+        meeting = dict(doc)  # shallow copy
+
+        gcal = doc.get("google_calendar_event") or {}
+        if isinstance(gcal, dict):
+            if "start" in gcal and "start" not in meeting:
+                meeting["start"] = gcal["start"]
+            if "end" in gcal and "end" not in meeting:
+                meeting["end"] = gcal["end"]
+            if "attendees" in gcal and "attendees" not in meeting:
+                meeting["attendees"] = gcal["attendees"]
+
+        # Heuristica de has_transcript: o doc terminou e transcript nao foi deletado.
+        # Nao usar `transcribe` (que indica "transcrevendo ao vivo", nao "tem armazenado").
+        ended = (doc.get("meeting_end_count") or 0) > 0
+        not_deleted = doc.get("transcript_deleted_at") is None
+        meeting["has_transcript"] = bool(ended and not_deleted)
+
+        return meeting
+
+    @staticmethod
+    def _segments_to_transcript_data(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Converte segmentos da API ao shape que `Transcript` espera.
+
+        API: `{document_id, start_timestamp, end_timestamp, text, source,
+              detected_speaker_name, ...}`
+        Transcript precisa de campos como `text`, opcionalmente `speaker`,
+        `timestamp`, `start_timestamp`, `end_timestamp`.
+        """
+        out: List[Dict[str, Any]] = []
+        for s in segments:
+            text = s.get("text") or ""
+            if not text.strip():
+                continue
+            seg = {
+                "text": text,
+                "start_timestamp": s.get("start_timestamp"),
+                "end_timestamp": s.get("end_timestamp"),
+            }
+            speaker = s.get("detected_speaker_name") or s.get("source")
+            if speaker:
+                # padroniza: 'microphone' -> 'MIC', 'system' -> 'SYS'
+                if speaker == "microphone":
+                    speaker = "MIC"
+                elif speaker == "system":
+                    speaker = "SYS"
+                seg["speaker"] = speaker
+            out.append(seg)
+        return out
+
+    @staticmethod
+    def _panels_to_ai_summary_html(panels: List[Dict[str, Any]]) -> Optional[str]:
+        """Extrai HTML do `original_content` dos paineis (formato AI Summary)."""
+        html_chunks: List[str] = []
+        for panel in panels:
+            content = panel.get("original_content")
+            if content and isinstance(content, str) and not content.strip().startswith("<hr>"):
+                html_chunks.append(content)
+        return "\n\n".join(html_chunks) if html_chunks else None
+
+    # ------------------------------------------------------------------
+    # API publica (mantida igual a versao legacy)
+    # ------------------------------------------------------------------
     def load_cache(self, force_reload: bool = False) -> Dict[str, Any]:
-        """
-        Load and parse the Granola cache file.
-
-        Args:
-            force_reload: If True, reload even if already cached
-
-        Returns:
-            Dict[str, Any]: Parsed cache data
-
-        Raises:
-            GranolaParseError: If cache file cannot be loaded or parsed
-        """
-        if self._cache_data is not None and not force_reload:
-            return self._cache_data
-
-        # Validate cache file exists and is readable
-        if not validate_cache_path(self.cache_path):
-            raise GranolaParseError(f"Cache file not found or not readable: {self.cache_path}")
-
-        try:
-            # Read the raw file content
-            with open(self.cache_path, 'r', encoding='utf-8') as f:
-                self._raw_data = f.read()
-
-            # First JSON parse - get the outer structure
-            try:
-                outer_data = json.loads(self._raw_data)
-            except json.JSONDecodeError as e:
-                raise GranolaParseError(f"Invalid JSON in cache file: {e}") from e
-
-            # Validate outer structure has 'cache' field
-            if not isinstance(outer_data, dict):
-                raise GranolaParseError("Cache file must contain a JSON object")
-
-            if 'cache' not in outer_data:
-                raise GranolaParseError("Cache file missing required 'cache' field")
-
-            cache_content = outer_data['cache']
-            if isinstance(cache_content, dict):
-                # v4 format: cache is already a parsed dict
-                self._cache_data = cache_content
-            elif isinstance(cache_content, str):
-                # v3 format: cache is a JSON string that needs second parse
-                try:
-                    self._cache_data = json.loads(cache_content)
-                except json.JSONDecodeError as e:
-                    raise GranolaParseError(f"Invalid JSON in cache content: {e}") from e
-            else:
-                raise GranolaParseError("Cache field must contain a JSON string or object")
-
-            if not isinstance(self._cache_data, dict):
-                raise GranolaParseError("Cache content must be a JSON object")
-
-            return self._cache_data
-
-        except Exception as e:
-            if isinstance(e, GranolaParseError):
-                raise
-            raise GranolaParseError(f"Error loading cache file: {e}") from e
+        """Compat: retorna um dict simbolico (nao ha mais cache local)."""
+        return {"state": {"documents": {}}, "source": "granola-api"}
 
     def get_meetings(self, debug: bool = False) -> List[Dict[str, Any]]:
-        """
-        Get all meetings from the cache.
-
-        Args:
-            debug: If True, print debug information about cache structure
-
-        Returns:
-            List[Dict[str, Any]]: List of meeting objects (combined documents and metadata)
-
-        Raises:
-            GranolaParseError: If cache cannot be loaded or meetings not found
-        """
-        cache_data = self.load_cache()
-
-        if debug:
-            print(f"DEBUG: Cache data keys: {list(cache_data.keys())}")
-
-        # Look for the 'state' key (Granola v3 format)
-        if 'state' not in cache_data:
-            raise GranolaParseError("Cache data missing required 'state' key")
-
-        state_data = cache_data['state']
-        if debug:
-            print(f"DEBUG: Found 'state' key with keys: {list(state_data.keys())}")
-
-        # Get documents (main meeting data)
-        documents = state_data.get('documents', {})
-        if debug:
-            print(f"DEBUG: Found {len(documents)} documents")
-
-        # Get meeting metadata (additional info)
-        meetings_metadata = state_data.get('meetingsMetadata', {})
-        if debug:
-            print(f"DEBUG: Found {len(meetings_metadata)} meeting metadata entries")
-
-        # Get transcripts
-        transcripts = state_data.get('transcripts', {})
-        if debug:
-            print(f"DEBUG: Found {len(transcripts)} transcripts")
-
-        # Get document panels (contains structured notes)
-        document_panels = state_data.get('documentPanels', {})
-        if debug:
-            print(f"DEBUG: Found {len(document_panels)} document panels")
-
-        # Get document lists (folders) for organization
-        document_lists = state_data.get('documentLists', {})
-        document_lists_metadata = state_data.get('documentListsMetadata', {})
-        if debug:
-            print(f"DEBUG: Found {len(document_lists)} document lists/folders")
-
-        # Create reverse mapping: meeting_id -> folder_info
-        meeting_to_folder = {}
-        for list_id, meeting_ids in document_lists.items():
-            folder_info = document_lists_metadata.get(list_id, {})
-            folder_name = folder_info.get('title', 'Unknown')
-            for meeting_id in meeting_ids:
-                meeting_to_folder[meeting_id] = {
-                    'folder_id': list_id,
-                    'folder_name': folder_name
-                }
-
-        # Combine documents with their metadata, transcripts, and panels
-        meetings = []
-        for doc_id, doc_data in documents.items():
-            # Start with document data
-            meeting = doc_data.copy()
-            
-            # Add metadata if available
-            if doc_id in meetings_metadata:
-                meta = meetings_metadata[doc_id]
-                # Only add metadata fields that don't conflict with document fields
-                for key, value in meta.items():
-                    if key not in meeting or not meeting[key]:
-                        meeting[key] = value
-
-            # Add transcript if available
-            if doc_id in transcripts:
-                meeting['transcript_data'] = transcripts[doc_id]
-
-            # Add document panels content (AI summaries and structured notes)
-            if doc_id in document_panels:
-                panels = document_panels[doc_id]
-                
-                # Extract AI summaries from original_content (HTML format)
-                ai_summaries = []
-                for panel_id, panel_data in panels.items():
-                    original_content = panel_data.get('original_content', '')
-                    if original_content and isinstance(original_content, str):
-                        # Skip panels that are just links
-                        if not original_content.strip().startswith('<hr>'):
-                            ai_summaries.append(original_content)
-                
-                if ai_summaries:
-                    # Combine all AI summaries into one
-                    meeting['ai_summary_html'] = '\n\n'.join(ai_summaries)
-                
-                # Look for the first panel with structured content (for fallback)
-                for panel_id, panel_data in panels.items():
-                    panel_content = panel_data.get('content')
-                    if panel_content and isinstance(panel_content, dict):
-                        meeting['panel_content'] = panel_content
-                        break
-
-            # Add folder information
-            if doc_id in meeting_to_folder:
-                folder_info = meeting_to_folder[doc_id]
-                meeting['folder_name'] = folder_info['folder_name']
-                meeting['folder_id'] = folder_info['folder_id']
-            else:
-                meeting['folder_name'] = None
-                meeting['folder_id'] = None
-
-            meetings.append(meeting)
-
-        if debug:
-            print(f"DEBUG: Successfully created {len(meetings)} combined meeting objects")
-
-        return meetings
+        """Lista TODOS os meetings (apenas metadata). Faz paginacao automatica."""
+        if self._docs_cache is None:
+            try:
+                raw_docs = self._client.list_all_documents()
+            except GranolaApiError as exc:
+                raise GranolaParseError(str(exc)) from exc
+            self._docs_cache = [self._doc_to_meeting_dict(d) for d in raw_docs]
+            if debug:
+                print(f"DEBUG: Loaded {len(self._docs_cache)} meetings from API")
+        return self._docs_cache
 
     def get_meeting_by_id(self, meeting_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get a specific meeting by ID.
-
-        Args:
-            meeting_id: The meeting ID to search for
-
-        Returns:
-            Optional[Dict[str, Any]]: Meeting object or None if not found
-        """
-        meetings = self.get_meetings()
-
-        for meeting in meetings:
-            if isinstance(meeting, dict):
-                # Try different possible ID fields
-                for id_field in ['id', 'meeting_id', 'session_id', 'uuid']:
-                    if meeting.get(id_field) == meeting_id:
-                        return meeting
-
+        """Busca um meeting pelo ID — apenas metadata (use get_enriched_meeting para tudo)."""
+        for m in self.get_meetings():
+            if m.get("id") == meeting_id:
+                return m
         return None
 
-    def validate_cache_structure(self) -> bool:
-        """
-        Validate that the cache has the expected structure.
+    def get_enriched_meeting(self, meeting_id: str) -> Optional[Dict[str, Any]]:
+        """Busca um meeting completo: metadata + transcript_data + ai_summary_html.
 
-        Returns:
-            bool: True if cache structure is valid
+        Faz 2-3 chamadas a API. Use quando precisar do transcript ou do summary.
         """
+        base = self.get_meeting_by_id(meeting_id)
+        if base is None:
+            return None
+        enriched = dict(base)
+
+        if enriched.get("has_transcript"):
+            try:
+                segments = self._client.get_document_transcript(meeting_id)
+                enriched["transcript_data"] = self._segments_to_transcript_data(segments)
+            except GranolaApiError:
+                # Falha de transcript nao deve impedir o resto
+                enriched["transcript_data"] = []
+
         try:
-            cache_data = self.load_cache()
-            meetings = self.get_meetings()
+            panels = self._client.get_document_panels(meeting_id)
+            summary_html = self._panels_to_ai_summary_html(panels)
+            if summary_html:
+                enriched["ai_summary_html"] = summary_html
+        except GranolaApiError:
+            pass
 
-            # Basic validation - cache should be a dict and meetings should be a list
-            return isinstance(cache_data, dict) and isinstance(meetings, list)
+        return enriched
 
+    def validate_cache_structure(self) -> bool:
+        """Compat: tenta listar meetings — se nao explodir, esta ok."""
+        try:
+            self.get_meetings()
+            return True
         except Exception:
             return False
 
     def get_cache_info(self) -> Dict[str, Any]:
-        """
-        Get information about the cache file and its contents.
-
-        Returns:
-            Dict[str, Any]: Cache information
-        """
+        """Compat: substitui cache file info por status da API."""
         info = {
-            'cache_path': self.cache_path,
-            'exists': os.path.exists(self.cache_path),
-            'readable': validate_cache_path(self.cache_path),
-            'size_bytes': 0,
-            'meeting_count': 0,
-            'valid_structure': False
+            "cache_path": "api://granola.ai",
+            "exists": True,
+            "readable": False,
+            "size_bytes": 0,
+            "meeting_count": 0,
+            "valid_structure": False,
         }
-
-        if info['exists']:
-            try:
-                info['size_bytes'] = os.path.getsize(self.cache_path)
-            except Exception:
-                pass
-
-        if info['readable']:
-            try:
-                meetings = self.get_meetings()
-                info['meeting_count'] = len(meetings)
-                info['valid_structure'] = True
-            except Exception:
-                pass
-
+        try:
+            meetings = self.get_meetings()
+            info["readable"] = True
+            info["meeting_count"] = len(meetings)
+            info["valid_structure"] = True
+        except Exception:
+            pass
         return info
 
     def reload(self) -> Dict[str, Any]:
-        """
-        Force reload the cache data.
-
-        Returns:
-            Dict[str, Any]: Reloaded cache data
-        """
-        return self.load_cache(force_reload=True)
+        """Forca recarregar a lista de documentos."""
+        self._docs_cache = None
+        self.get_meetings()
+        return self.load_cache()

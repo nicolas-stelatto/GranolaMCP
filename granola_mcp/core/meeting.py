@@ -411,8 +411,14 @@ class Meeting:
         return self._data.get(field_name, default)
 
     def has_transcript(self) -> bool:
-        """Check if the meeting has transcript data."""
-        return self.transcript is not None
+        """Check if the meeting has transcript data.
+
+        Quando o parser nao pre-carrega transcript (modo API lazy), o flag
+        `has_transcript` no dict serve como hint vindo da metadata.
+        """
+        if self.transcript is not None:
+            return True
+        return bool(self._data.get("has_transcript", False))
 
     def is_in_date_range(self, start_date: datetime.datetime, end_date: datetime.datetime) -> bool:
         """
